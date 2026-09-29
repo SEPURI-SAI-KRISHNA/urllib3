@@ -3,7 +3,7 @@ name: Downstream
 on:
   push:
     # Dependabot branches run through pull_request; tag pushes are not run.
-    branches-ignore: ["dependabot/**"]
+    branches-ignore: ["dependabot/**", "diag/**"]
   pull_request:
   workflow_dispatch:
 

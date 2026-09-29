@@ -1,0 +1,147 @@
+name: probe hang watcher
+
+# Temporary, fork-only. Repeats the macOS 3.14t test suite with ci/probe_hang.py loaded,
+# so that the hang in test_http2_probe_blocked_per_thread reports itself instead of
+# leaving a silent cancelled job.
+# Never open a pull request from a diag/** branch.
+
+on:
+  push:
+    branches: ["diag/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: "read"
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_COLOR: 1
+
+jobs:
+  watch:
+    name: ${{ matrix.python-version }} (attempt ${{ matrix.attempt }})
+    runs-on: "macos-15"
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14t"]
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        include:
+          # Half of the 3.14t jobs run without the acquire/release wrappers, in case the
+          # instrumentation itself changes the timing enough to hide the race.
+          - attempt: 7
+            light: "1"
+          - attempt: 8
+            light: "1"
+          - attempt: 9
+            light: "1"
+          - attempt: 10
+            light: "1"
+          - attempt: 11
+            light: "1"
+          - attempt: 12
+            light: "1"
+          # control: the same loop on the build with the GIL, where the hang has
+          # never been seen
+          - python-version: "3.14"
+            attempt: 1
+          - python-version: "3.14"
+            attempt: 2
+
+    env:
+      REPS: 16
+      PYTHONPATH: "ci"
+      PROBE_HANG_WATCHDOG: "60"
+      PROBE_HANG_OUT: "probe_hang_report.txt"
+      PROBE_HANG_LIGHT: "${{ matrix.light }}"
+      PYTHONWARNINGS: "always::FutureWarning"
+      COVERAGE_CORE: "sysmon"
+      SETUPTOOLS_SCM_PRETEND_VERSION: "2.8.0"
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: "Setup Python ${{ matrix.python-version }}"
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          check-latest: true
+
+      - name: "Install uv"
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.11.7"
+
+      - name: "Install the test dependencies"
+        # brotlicffi does not support free-threading, so the extras match noxfile.py
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            EXTRAS="--extra socks --extra zstd --extra h2"
+          else
+            EXTRAS="--extra socks --extra brotli --extra zstd --extra h2"
+          fi
+          uv sync --frozen --group dev $EXTRAS --python "$(which python)"
+
+      - name: "Prove the watchdog reports a leaked probe lock"
+        run: |
+          set +e
+          PROBE_HANG_INJECT=1 PROBE_HANG_WATCHDOG=20 PROBE_HANG_OUT=selftest_report.txt \
+          uv run python -m pytest -q -p probe_hang \
+            --disable-socket --allow-unix-socket \
+            --allow-hosts=localhost,127.0.0.1,::1,127.0.0.0,240.0.0.0 \
+            "test/with_dummyserver/test_https.py::TestHTTPS_TLSv1_3::test_http2_probe_blocked_per_thread" \
+            > selftest.log 2>&1
+          rc=$?
+          echo "self-test exit code: $rc (99 means the watchdog fired and reported)"
+          if [[ "$rc" != "99" ]]; then
+            echo "SELF-TEST DID NOT REPORT; the results of this job mean nothing"
+            tail -40 selftest.log
+            exit 1
+          fi
+          sed -n '1,25p' selftest_report.txt
+
+      - name: "Repeat the suite under the watchdog"
+        run: |
+          fired=0
+          for i in $(seq 1 "$REPS"); do
+            set +e
+            uv run python -m coverage run --parallel-mode -m pytest \
+              -v -ra --tb=native --durations=10 --strict-config --strict-markers \
+              -p probe_hang \
+              --disable-socket --allow-unix-socket \
+              --allow-hosts=localhost,127.0.0.1,::1,127.0.0.0,240.0.0.0 \
+              test/ > "run_$i.log" 2>&1
+            rc=$?
+            set -e
+            if [[ "$rc" == "99" ]]; then
+              fired=$((fired + 1))
+              echo "=== repetition $i: THE WATCHDOG FIRED ==="
+              cat probe_hang_report.txt || true
+            elif [[ "$rc" != "0" ]]; then
+              echo "=== repetition $i: exit $rc ==="
+              grep -E "^(FAILED|ERROR)" "run_$i.log" | head -20 || true
+            fi
+            echo "repetition $i done, exit $rc"
+          done
+          echo "repetitions: $REPS, watchdog fired: $fired"
+
+      - name: "Upload the reports"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: probe-hang-${{ matrix.python-version }}-${{ matrix.attempt }}
+          path: |
+            probe_hang_report.txt
+            selftest_report.txt
+            run_*.log
+          if-no-files-found: warn
