@@ -3,6 +3,11 @@ name: probe hang watcher
 # Temporary, fork-only. Repeats the macOS 3.14t test suite with ci/probe_hang.py loaded,
 # so that the hang in test_http2_probe_blocked_per_thread reports itself instead of
 # leaving a silent cancelled job.
+#
+# Round 2 is shaped differently from round 1: many jobs running the suite twice, rather
+# than a few jobs running it sixteen times. Every one of the four CI hangs was the first
+# and only suite run in a fresh job, and round 1 contributed only 11 such cold runs out
+# of 176, so it said very little about the case that actually fails.
 # Never open a pull request from a diag/** branch.
 
 on:
@@ -22,43 +27,28 @@ env:
 
 jobs:
   watch:
-    name: ${{ matrix.python-version }} (attempt ${{ matrix.attempt }})
+    name: "3.14t #${{ matrix.attempt }} ${{ matrix.attempt > 30 && 'light' || 'full' }}"
     runs-on: "macos-15"
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
-        python-version: ["3.14t"]
-        attempt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        include:
-          # Half of the 3.14t jobs run without the acquire/release wrappers, in case the
-          # instrumentation itself changes the timing enough to hide the race.
-          - attempt: 7
-            light: "1"
-          - attempt: 8
-            light: "1"
-          - attempt: 9
-            light: "1"
-          - attempt: 10
-            light: "1"
-          - attempt: 11
-            light: "1"
-          - attempt: 12
-            light: "1"
-          # control: the same loop on the build with the GIL, where the hang has
-          # never been seen
-          - python-version: "3.14"
-            attempt: 1
-          - python-version: "3.14"
-            attempt: 2
+        attempt:
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+           21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
+           39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+           57, 58, 59, 60]
 
     env:
-      REPS: 16
+      REPS: 2
       PYTHONPATH: "ci"
       PROBE_HANG_WATCHDOG: "60"
       PROBE_HANG_OUT: "probe_hang_report.txt"
-      PROBE_HANG_LIGHT: "${{ matrix.light }}"
+      # The wrappers add a lock and a list append to the very code whose timing is in
+      # question, so half of the jobs run with only the watchdog.
+      PROBE_HANG_LIGHT: "${{ matrix.attempt > 30 && '1' || '' }}"
       PYTHONWARNINGS: "always::FutureWarning"
       COVERAGE_CORE: "sysmon"
       SETUPTOOLS_SCM_PRETEND_VERSION: "2.8.0"
@@ -70,10 +60,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: "Setup Python ${{ matrix.python-version }}"
+      - name: "Setup Python 3.14t"
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "${{ matrix.python-version }}"
+          python-version: "3.14t"
           allow-prereleases: true
           check-latest: true
 
@@ -84,33 +74,31 @@ jobs:
 
       - name: "Install the test dependencies"
         # brotlicffi does not support free-threading, so the extras match noxfile.py
-        run: |
-          if [[ "${{ matrix.python-version }}" == *t ]]; then
-            EXTRAS="--extra socks --extra zstd --extra h2"
-          else
-            EXTRAS="--extra socks --extra brotli --extra zstd --extra h2"
-          fi
-          uv sync --frozen --group dev $EXTRAS --python "$(which python)"
+        run: uv sync --frozen --group dev --extra socks --extra zstd --extra h2 --python "$(which python)"
 
       - name: "Prove the watchdog reports a leaked probe lock"
         run: |
           set +e
-          PROBE_HANG_INJECT=1 PROBE_HANG_WATCHDOG=20 PROBE_HANG_OUT=selftest_report.txt \
-          uv run python -m pytest -q -p probe_hang \
-            --disable-socket --allow-unix-socket \
-            --allow-hosts=localhost,127.0.0.1,::1,127.0.0.0,240.0.0.0 \
-            "test/with_dummyserver/test_https.py::TestHTTPS_TLSv1_3::test_http2_probe_blocked_per_thread" \
-            > selftest.log 2>&1
-          rc=$?
-          echo "self-test exit code: $rc (99 means the watchdog fired and reported)"
+          rc=1
+          for try in 1 2 3; do
+            PROBE_HANG_INJECT=1 PROBE_HANG_WATCHDOG=20 PROBE_HANG_OUT=selftest_report.txt \
+            uv run python -m pytest -q -p probe_hang \
+              --disable-socket --allow-unix-socket \
+              --allow-hosts=localhost,127.0.0.1,::1,127.0.0.0,240.0.0.0 \
+              "test/with_dummyserver/test_https.py::TestHTTPS_TLSv1_3::test_http2_probe_blocked_per_thread" \
+              > "selftest_$try.log" 2>&1
+            rc=$?
+            echo "self-test attempt $try exit code: $rc (99 means the watchdog fired and reported)"
+            [[ "$rc" == "99" ]] && break
+          done
           if [[ "$rc" != "99" ]]; then
             echo "SELF-TEST DID NOT REPORT; the results of this job mean nothing"
-            tail -40 selftest.log
+            tail -40 "selftest_3.log"
             exit 1
           fi
-          sed -n '1,25p' selftest_report.txt
+          sed -n '1,20p' selftest_report.txt
 
-      - name: "Repeat the suite under the watchdog"
+      - name: "Run the suite under the watchdog"
         run: |
           fired=0
           for i in $(seq 1 "$REPS"); do
@@ -125,21 +113,22 @@ jobs:
             set -e
             if [[ "$rc" == "99" ]]; then
               fired=$((fired + 1))
-              echo "=== repetition $i: THE WATCHDOG FIRED ==="
+              echo "=== run $i: THE WATCHDOG FIRED ==="
               cat probe_hang_report.txt || true
             elif [[ "$rc" != "0" ]]; then
-              echo "=== repetition $i: exit $rc ==="
+              echo "=== run $i: exit $rc ==="
               grep -E "^(FAILED|ERROR)" "run_$i.log" | head -20 || true
             fi
-            echo "repetition $i done, exit $rc"
+            grep -E "^\[probe_hang\]" "run_$i.log" || true
+            echo "run $i done, exit $rc"
           done
-          echo "repetitions: $REPS, watchdog fired: $fired"
+          echo "runs: $REPS, watchdog fired: $fired"
 
       - name: "Upload the reports"
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: probe-hang-${{ matrix.python-version }}-${{ matrix.attempt }}
+          name: probe-hang-${{ matrix.attempt }}
           path: |
             probe_hang_report.txt
             selftest_report.txt

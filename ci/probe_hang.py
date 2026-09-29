@@ -51,6 +51,8 @@ _STDERR_FD = os.dup(2)
 
 _events: list[tuple[float, int, str, str]] = []
 _events_lock = threading.Lock()
+_leaked = threading.Event()
+_near_misses: list[str] = []
 state: dict[str, typing.Any] = {
     "test": "<none>",
     "patched": False,
@@ -95,15 +97,17 @@ def _patch() -> None:
         _rec(f"acquire_and_get({host}:{port}) enter (entry {nth})")
         injecting = INJECT and "blocked_per_thread" in state["test"]
         if injecting and nth == 1:
-            # Hold the first caller back so a later one wins the lock; otherwise the
-            # first item's future fails and the test fails instead of hanging.
-            time.sleep(0.3)
+            # Hold the first caller back until another one has leaked the lock.
+            # A plain sleep here is a race: when the first caller wins the lock anyway
+            # its own future fails and the test fails instead of hanging.
+            _leaked.wait(20)
         value = real_acquire(host, port)
         held = " [this thread now holds the lock]" if value is None else ""
         _rec(f"acquire_and_get({host}:{port}) -> {value!r}{held}")
         if injecting and value is None and nth != 1 and not state["injected"]:
             state["injected"] = 1
             _rec("INJECT: raising while holding the probe lock")
+            _leaked.set()
             raise AssertionError(
                 "injected failure, as if an assert in _connect_callback"
             )
@@ -123,6 +127,15 @@ def _patch() -> None:
             return real_connect(self)
         except BaseException as e:
             _rec(f"connect() raised {type(e).__name__}: {str(e)[:150]}")
+            # Only in the test under investigation: everywhere else a raising
+            # connect() is what the test asked for.
+            if (
+                "blocked_per_thread" in state["test"]
+                and type(e).__name__ != "ConnectTimeoutError"
+            ):
+                _near_misses.append(
+                    f"{state['test']}: connect() raised {type(e).__name__}: {str(e)[:150]}"
+                )
             raise
 
     conn.HTTPSConnection.connect = connect
@@ -227,9 +240,38 @@ def pytest_runtest_protocol(
         return (yield)
     finally:
         state["deadline"] = None
+        _check_for_a_leaked_lock(item.nodeid)
+
+
+def _check_for_a_leaked_lock(nodeid: str) -> None:
+    """A leak that did not happen to hang this run is still worth knowing about."""
+    probe = state.get("probe")
+    if probe is None:
+        return
+    try:
+        cache = probe._HTTP2_PROBE_CACHE
+        for key, lock in list(cache._cache_locks.items()):
+            free = lock.acquire(blocking=False)
+            if free:
+                lock.release()
+            else:
+                _near_misses.append(
+                    f"{nodeid}: probe lock {key} was still held: {lock!r}"
+                )
+    except BaseException:  # pragma: no cover - defensive
+        pass
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: object) -> None:
+    # Report near misses even when nothing hung, so a quiet run is not a blank one.
+    print(
+        f"\n[probe_hang] probe events recorded: {len(_events)}; "
+        f"near misses: {len(_near_misses)}",
+        file=sys.stderr,
+    )
+    for miss in _near_misses:
+        print(f"[probe_hang] NEAR MISS {miss}", file=sys.stderr)
+    sys.stderr.flush()
     # Keep watching: a leaked lock can hang the interpreter at exit instead.
     state["phase"] = "session shutdown"
     state["deadline"] = time.monotonic() + WATCHDOG
